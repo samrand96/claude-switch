@@ -3,7 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -93,6 +93,11 @@ pub fn remove_state(name: &str) {
 
 /// Starts a process that outlives us, with no inherited console or stdio.
 pub fn spawn_detached(cmd: &mut Command) -> Result<u32> {
+    Ok(spawn_detached_child(cmd)?.id())
+}
+
+/// Like [`spawn_detached`], keeping the handle so the caller can see whether (and how) it exited.
+pub fn spawn_detached_child(cmd: &mut Command) -> Result<Child> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -113,10 +118,8 @@ pub fn spawn_detached(cmd: &mut Command) -> Result<u32> {
             });
         }
     }
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("could not start {:?}", cmd.get_program()))?;
-    Ok(child.id())
+    cmd.spawn()
+        .with_context(|| format!("could not start {:?}", cmd.get_program()))
 }
 
 /// Quotes one argument for a Windows command line (CommandLineToArgvW rules).

@@ -6,6 +6,9 @@ use crate::config::Config;
 use crate::core::desktop::{self, DesktopInstall};
 use crate::ui::{self, prompt};
 
+const NO_PROFILES: &str =
+    "no profiles yet — run `cswitch setup` (or just `cswitch`) to create them";
+
 pub fn interactive() -> bool {
     console::user_attended() && console::Term::stdout().is_term()
 }
@@ -14,7 +17,7 @@ pub fn interactive() -> bool {
 /// to the default profile when there is no terminal).
 pub fn resolve_profile(cfg: &Config, given: Option<&str>, question: &str) -> Result<String> {
     if cfg.profiles.is_empty() {
-        bail!("no profiles yet — run `cswitch setup` (or just `cswitch`) to create them");
+        bail!(NO_PROFILES);
     }
     if let Some(name) = given {
         cfg.profile(name)?;
@@ -33,6 +36,9 @@ pub fn resolve_profile(cfg: &Config, given: Option<&str>, question: &str) -> Res
 /// Arrow-key profile picker. `None` on Esc.
 pub fn pick_profile(cfg: &Config, question: &str) -> Result<Option<String>> {
     let names = cfg.profile_names();
+    if names.is_empty() {
+        bail!(NO_PROFILES);
+    }
     let items: Vec<String> = names.iter().map(|n| profile_item(cfg, n)).collect();
     Ok(prompt::select(question, &items, 0)?.map(|i| names[i].clone()))
 }

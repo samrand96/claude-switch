@@ -14,12 +14,14 @@
 //! 2. otherwise the only profile whose Desktop is running;
 //! 3. otherwise the configured policy: ask, most recently launched, or default profile.
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::{Config, DeepLinkPolicy, paths};
 use crate::core::desktop::{self, DesktopInstall};
@@ -79,6 +81,14 @@ pub fn handle(url: &str, windowed: bool) -> Result<()> {
         sys::log("router: self-test link received");
         return sys::write_state(&format!("ping-{nonce}"), &sys::now_unix());
     }
+    if is_login_link(&url) && is_repeat(&url) {
+        sys::log(format!(
+            "router: {} again within {}s, ignored (already delivered)",
+            desktop::redact_link(&url),
+            REPEAT_WINDOW.as_secs()
+        ));
+        return Ok(());
+    }
     let cfg = Config::load()?;
     let install = desktop::detect(&cfg, false)
         .context("Claude Desktop is not installed (or could not be found)")?;
@@ -97,6 +107,49 @@ pub fn handle(url: &str, windowed: bool) -> Result<()> {
     ));
     desktop::launch(&cfg, &install, &target, Some(&url))?;
     Ok(())
+}
+
+/// Browsers often fire the same link several times in a row, and people click "Open" again
+/// when nothing seems to happen. A sign-in link works once: every repeat reaches the instance that
+/// just used it and makes the sign-in fail.
+const REPEAT_WINDOW: Duration = Duration::from_secs(20);
+
+/// Has this exact link been delivered within [`REPEAT_WINDOW`]? Marks it as delivered if not.
+/// The marker is created atomically, so links fired at the same moment are delivered once.
+fn is_repeat(url: &str) -> bool {
+    paths::state_dir().is_ok_and(|dir| is_repeat_in(&dir, url))
+}
+
+fn is_repeat_in(dir: &std::path::Path, url: &str) -> bool {
+    let _ = fs::create_dir_all(dir);
+    let fresh = |path: &std::path::Path| {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < REPEAT_WINDOW)
+    };
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let stale_marker =
+                entry.file_name().to_string_lossy().starts_with("link-") && !fresh(&entry.path());
+            if stale_marker {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let digest = Sha256::digest(url.as_bytes());
+    let key: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let marker = dir.join(format!("link-{key}"));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => fresh(&marker),
+        Err(_) => false,
+    }
 }
 
 fn ping_nonce(url: &str) -> Option<String> {
@@ -362,6 +415,8 @@ mod platform {
         pub const USER_CHOICE: &str =
             r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude\UserChoice";
         pub const USER_CHOICE_LATEST: &str = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude\UserChoiceLatest";
+        /// Newer Windows 11 builds keep the choice one level down, in `UserChoiceLatest\ProgId`.
+        pub const USER_CHOICE_LATEST_PROGID: &str = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude\UserChoiceLatest\ProgId";
     }
 
     #[cfg(windows)]
@@ -370,8 +425,11 @@ mod platform {
         use winreg::enums::HKEY_CURRENT_USER;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let command = handler_command()?;
-        let helper = paths::helper_exe()?;
-        let icon = format!("\"{}\",0", helper.display());
+        let icon_file = match crate::core::integrate::app_icon() {
+            Ok(file) => file,
+            Err(_) => paths::helper_exe()?,
+        };
+        let icon = format!("\"{}\",0", icon_file.display());
 
         // Our own ProgID — what the user selects in Settings → Default apps.
         let (progid, _) = hkcu.create_subkey(format!(r"{}\{PROGID}", keys::CLASSES))?;
@@ -380,8 +438,15 @@ mod platform {
         progid.set_value("FriendlyTypeName", &"Claude link (Claude Switch)")?;
         let (icon_key, _) = progid.create_subkey("DefaultIcon")?;
         icon_key.set_value("", &icon)?;
-        let (cmd_key, _) = progid.create_subkey(r"shell\open\command")?;
+        // The name Windows shows for the handler; without it, the executable has no
+        // description and Settings lists it as "cswitchw.exe".
+        let (open_key, _) = progid.create_subkey(r"shell\open")?;
+        open_key.set_value("FriendlyAppName", &APP_NAME)?;
+        let (cmd_key, _) = open_key.create_subkey("command")?;
         cmd_key.set_value("", &command)?;
+        let (app_key, _) = progid.create_subkey("Application")?;
+        app_key.set_value("ApplicationName", &APP_NAME)?;
+        app_key.set_value("ApplicationIcon", &icon)?;
 
         // Capabilities make "Claude Switch" show up as a candidate for CLAUDE links.
         let (caps, _) = hkcu.create_subkey(keys::CAPABILITIES)?;
@@ -485,13 +550,17 @@ mod platform {
         if !ours_registered {
             return RouterState::NotRegistered;
         }
-        let choice = [keys::USER_CHOICE_LATEST, keys::USER_CHOICE]
-            .iter()
-            .find_map(|k| {
-                hkcu.open_subkey(k)
-                    .and_then(|key| key.get_value::<String, _>("ProgId"))
-                    .ok()
-            });
+        let choice = [
+            keys::USER_CHOICE_LATEST_PROGID,
+            keys::USER_CHOICE_LATEST,
+            keys::USER_CHOICE,
+        ]
+        .iter()
+        .find_map(|k| {
+            hkcu.open_subkey(k)
+                .and_then(|key| key.get_value::<String, _>("ProgId"))
+                .ok()
+        });
         match choice {
             Some(progid) if progid.eq_ignore_ascii_case(PROGID) => RouterState::Active,
             Some(progid) => RouterState::NotDefault {
@@ -640,6 +709,21 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivers_each_sign_in_link_once() {
+        let dir = std::env::temp_dir().join(format!("cswitch-repeat-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let link = "claude://login/google-auth?code=abc&state=1";
+        assert!(!is_repeat_in(&dir, link));
+        assert!(is_repeat_in(&dir, link));
+        assert!(is_repeat_in(&dir, link));
+        assert!(!is_repeat_in(
+            &dir,
+            "claude://login/google-auth?code=def&state=2"
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn recognizes_login_links() {

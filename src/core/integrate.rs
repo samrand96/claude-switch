@@ -474,6 +474,15 @@ fn icons_dir() -> Result<PathBuf> {
     Ok(paths::cswitch_home()?.join("icons"))
 }
 
+/// Claude Switch's own icon as a file — the executables carry no icon resource.
+pub fn app_icon() -> Result<PathBuf> {
+    let icons = icons_dir()?;
+    fs::create_dir_all(&icons)?;
+    let icon = icons.join("cswitch.ico");
+    fs::write(&icon, profile_icon(Rgb(0xD9, 0x77, 0x57)))?;
+    Ok(icon)
+}
+
 pub fn shortcuts_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         dirs::data_dir().map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs\Claude Switch"))
@@ -527,8 +536,7 @@ pub fn create_shortcuts(cfg: &Config, install: Option<&DesktopInstall>) -> Resul
         made.push(format!("Claude Code ({label})"));
     }
     if cfg!(windows) {
-        let icon = icons.join("cswitch.ico");
-        fs::write(&icon, profile_icon(Rgb(0xD9, 0x77, 0x57)))?;
+        let icon = app_icon()?;
         platform_shortcut(&dir, "Claude Switch", &exe, &[], &icon, true, None)?;
         made.push("Claude Switch".to_string());
     }

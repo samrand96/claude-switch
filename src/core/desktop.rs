@@ -8,12 +8,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::config::{Config, LaunchMethod, expand_home, normalize_path};
 use crate::core::env::{self, Target};
@@ -401,30 +401,45 @@ pub fn launch(
         let mut cmd = Command::new(&install.exe);
         cmd.args(&args);
         plan.apply(&mut cmd);
-        match sys::spawn_detached(&mut cmd) {
-            Ok(pid)
-                if install.kind == InstallKind::Msix
-                    && cfg.desktop.launch_method == LaunchMethod::Auto
-                    && running.is_none()
-                    && !survived_start(cfg, install, name, pid) =>
-            {
-                // Some Store builds refuse to run without their package identity and exit at
-                // once; start them through package activation instead.
-                sys::log(
-                    "desktop: direct launch exited immediately, falling back to activation \
-                     (the profile's environment variables do not reach an activated Store app)",
-                );
-                activate(install, &args)?
-            }
-            Ok(pid) => LaunchReport {
-                method: "direct",
-                pid: Some(pid),
-                already_running: running.is_some(),
+        let store_auto =
+            install.kind == InstallKind::Msix && cfg.desktop.launch_method == LaunchMethod::Auto;
+        let direct = |pid: u32, already_running: bool| LaunchReport {
+            method: "direct",
+            pid: Some(pid),
+            already_running,
+        };
+        match sys::spawn_detached_child(&mut cmd) {
+            Ok(mut child) if store_auto && running.is_none() => match watch_start(&mut child) {
+                Started::Running => direct(child.id(), false),
+                Started::HandedOff => {
+                    // Never re-send: sign-in links work once, and a second copy makes the
+                    // instance that just used it fail the sign-in.
+                    sys::log(
+                        "desktop: handed over to an instance of this profile that was already \
+                         running",
+                    );
+                    direct(child.id(), true)
+                }
+                Started::Failed(_)
+                    if instances(cfg, install)
+                        .iter()
+                        .any(|i| i.profile.as_deref() == Some(name)) =>
+                {
+                    direct(child.id(), true)
+                }
+                Started::Failed(code) => {
+                    // Some Store builds refuse to run without their package identity and exit at
+                    // once; start them through package activation instead.
+                    sys::log(format!(
+                        "desktop: direct launch failed (exit code {}), falling back to activation \
+                         (the profile's environment variables do not reach an activated Store app)",
+                        code.map_or_else(|| "unknown".to_string(), |c| c.to_string())
+                    ));
+                    activate(install, &args)?
+                }
             },
-            Err(err)
-                if install.kind == InstallKind::Msix
-                    && cfg.desktop.launch_method == LaunchMethod::Auto =>
-            {
+            Ok(child) => direct(child.id(), running.is_some()),
+            Err(err) if store_auto => {
                 sys::log(format!(
                     "desktop: direct launch failed ({err:#}), falling back to activation \
                      (the profile's environment variables do not reach an activated Store app)"
@@ -435,7 +450,7 @@ pub fn launch(
         }
     };
     let report = LaunchReport {
-        already_running: running.is_some(),
+        already_running: running.is_some() || report.already_running,
         ..report
     };
 
@@ -457,20 +472,28 @@ pub fn launch(
     Ok(report)
 }
 
-/// Waits briefly to see whether a freshly started Desktop process stays up (or has already
-/// handed over to an instance of the same profile).
-fn survived_start(cfg: &Config, install: &DesktopInstall, name: &str, pid: u32) -> bool {
+enum Started {
+    /// Still up after a few seconds: a new instance.
+    Running,
+    /// Exited cleanly: Electron's second instance, which passes its arguments (and the link) to
+    /// the instance already running on the same data directory, then quits with code 0.
+    HandedOff,
+    /// Exited with an error, e.g. a Store build that refuses to run without its package identity.
+    Failed(Option<i32>),
+}
+
+/// Watches a freshly started Desktop process for a few seconds.
+fn watch_start(child: &mut Child) -> Started {
     for _ in 0..12 {
         std::thread::sleep(Duration::from_millis(250));
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
-        if system.process(Pid::from_u32(pid)).is_none() {
-            return instances(cfg, install)
-                .iter()
-                .any(|i| i.profile.as_deref() == Some(name));
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) if status.success() => return Started::HandedOff,
+            Ok(Some(status)) => return Started::Failed(status.code()),
+            Err(_) => return Started::Running,
         }
     }
-    true
+    Started::Running
 }
 
 fn activate(install: &DesktopInstall, args: &[String]) -> Result<LaunchReport> {
