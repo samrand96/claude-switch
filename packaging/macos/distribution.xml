@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Filled in by build-pkg.sh: @VERSION@ @PKG_VERSION@ @ARCH@ @MIN_OS@ @ID@ -->
+<installer-gui-script minSpecVersion="2">
+    <title>Claude Switch @VERSION@</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="@ARCH@"/>
+    <domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="@MIN_OS@"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="@ID@"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="@ID@" visible="false">
+        <pkg-ref id="@ID@"/>
+    </choice>
+    <pkg-ref id="@ID@" version="@PKG_VERSION@" onConclusion="none">claude-switch.pkg</pkg-ref>
+</installer-gui-script>

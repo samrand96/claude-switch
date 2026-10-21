@@ -1,0 +1,17 @@
+#!/bin/sh
+# Runs as root after the package is installed: puts cswitch on PATH and wires up completions.
+# Only symlinks are created; folders that already exist are never re-owned or re-moded.
+prefix=/usr/local/claude-switch
+
+link() {
+  target="$1"
+  name="$2"
+  [ -d "$(dirname "$name")" ] || mkdir -p "$(dirname "$name")"
+  ln -sfn "$target" "$name"
+}
+
+link "$prefix/bin/cswitch" /usr/local/bin/cswitch
+link "$prefix/share/zsh/site-functions/_cswitch" /usr/local/share/zsh/site-functions/_cswitch
+link "$prefix/share/fish/vendor_completions.d/cswitch.fish" /usr/local/share/fish/vendor_completions.d/cswitch.fish
+link "$prefix/share/bash-completion/completions/cswitch" /usr/local/share/bash-completion/completions/cswitch
+exit 0

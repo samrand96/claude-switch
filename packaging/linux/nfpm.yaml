@@ -1,0 +1,94 @@
+# Linux packages for Claude Switch: .deb, .rpm, .apk (Alpine) and Arch .pkg.tar.zst.
+#
+# The binary is a static musl build, so one package per architecture runs on every distro.
+# Used by .github/workflows/release.yml; by hand (from the repository root):
+#
+#   VERSION=1.2.3 ARCH=amd64 BINARY=target/x86_64-unknown-linux-musl/release/cswitch \
+#   COMPLETIONS=/tmp/completions nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/
+#
+# ARCH uses Go names (amd64, arm64); nfpm maps them per format (x86_64 / aarch64 for rpm…).
+# COMPLETIONS is a folder with cswitch.bash, _cswitch and cswitch.fish
+# (`cswitch completions bash|zsh|fish`).
+
+name: claude-switch
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: 1
+section: utils
+priority: optional
+maintainer: samrand96 <samrand96@users.noreply.github.com>
+vendor: samrand96
+homepage: https://github.com/samrand96/claude-switch
+license: MIT
+description: |-
+  Run work and personal Claude side by side, fully isolated.
+  Every profile gets its own Claude Code configuration and sign-in and its own
+  Claude Desktop instance; sign-in pages open in the profile's own browser and
+  return to the right window. Run `cswitch` to set up your profiles.
+
+# Used to register the claude:// link handler and open sign-in pages.
+recommends:
+  - xdg-utils
+
+contents:
+  - src: ${BINARY}
+    dst: /usr/bin/cswitch
+    expand: true
+    file_info:
+      mode: 0755
+
+  - src: ${COMPLETIONS}/cswitch.bash
+    dst: /usr/share/bash-completion/completions/cswitch
+    expand: true
+    file_info:
+      mode: 0644
+
+  - src: ${COMPLETIONS}/cswitch.fish
+    dst: /usr/share/fish/vendor_completions.d/cswitch.fish
+    expand: true
+    file_info:
+      mode: 0644
+
+  # zsh looks in vendor-completions on Debian/Ubuntu and in site-functions elsewhere.
+  - src: ${COMPLETIONS}/_cswitch
+    dst: /usr/share/zsh/vendor-completions/_cswitch
+    expand: true
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ${COMPLETIONS}/_cswitch
+    dst: /usr/share/zsh/site-functions/_cswitch
+    expand: true
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: ${COMPLETIONS}/_cswitch
+    dst: /usr/share/zsh/site-functions/_cswitch
+    expand: true
+    packager: apk
+    file_info:
+      mode: 0644
+  - src: ${COMPLETIONS}/_cswitch
+    dst: /usr/share/zsh/site-functions/_cswitch
+    expand: true
+    packager: archlinux
+    file_info:
+      mode: 0644
+
+  - src: ./LICENSE
+    dst: /usr/share/licenses/claude-switch/LICENSE
+    file_info:
+      mode: 0644
+  - src: ./README.md
+    dst: /usr/share/doc/claude-switch/README.md
+    file_info:
+      mode: 0644
+
+deb:
+  fields:
+    Bugs: https://github.com/samrand96/claude-switch/issues
+
+archlinux:
+  packager: samrand96 <samrand96@users.noreply.github.com>

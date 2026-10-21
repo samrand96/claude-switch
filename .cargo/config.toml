@@ -1,0 +1,17 @@
+# Release binaries must run on a clean machine, with nothing else installed.
+
+# Windows: link the C runtime statically, so cswitch.exe does not need the Visual C++
+# Redistributable (vcruntime140.dll).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Linux: fully static musl binaries run on every distribution (no glibc version floor).
+# rust-lld ships with Rust, so x86_64 and arm64 cross-link without a C cross toolchain.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

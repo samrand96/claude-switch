@@ -1,0 +1,475 @@
+name: Release
+
+# Builds Claude Switch for Windows, macOS and Linux on x86_64 and arm64, wraps each build in the
+# platform's native installer, installs/uninstalls what the runner can, and — for a `v*` tag —
+# publishes everything as a GitHub release.
+#
+#   Windows  claude-switch-<v>-windows-{x64,arm64}-setup.exe   (per-user, no admin rights)
+#            cswitch-{x86_64,aarch64}-pc-windows-msvc.zip
+#   macOS    claude-switch-<v>-macos-{arm64,x86_64}.pkg
+#            cswitch-{aarch64,x86_64}-apple-darwin.tar.gz
+#   Linux    claude-switch_<v>-1_{amd64,arm64}.deb   claude-switch-<v>-1.{x86_64,aarch64}.rpm
+#            claude-switch_<v>-r1_{x86_64,aarch64}.apk   claude-switch-<v>-1-{x86_64,aarch64}.pkg.tar.zst
+#            cswitch-{x86_64,aarch64}-unknown-linux-musl.tar.gz   (static, any distribution)
+#   SHA256SUMS.txt
+#
+# Run it from the Actions tab (workflow_dispatch) to build and test every installer without
+# publishing; the files are attached to the run as artifacts.
+#
+# Pushing the `nightly` tag publishes a "Nightly" pre-release instead, replacing the previous one:
+#   git tag -f nightly && git push -f origin nightly
+
+on:
+  push:
+    tags: ["v*", "nightly"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - ".cargo/config.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Inno Setup (Windows installer compiler) — pinned, verified by SHA-256 before it runs.
+  INNO_VERSION: "7.1.0"
+  INNO_SHA256: "0362A383ED217D4C4239B5933866DD96D3EB2102737DA92F80F6057A4B40DF2F"
+  # nfpm (Linux package builder) — pinned, verified against its release checksums.
+  NFPM_VERSION: "2.48.0"
+  NFPM_SHA256: "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750"
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      title: ${{ steps.version.outputs.title }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read version (and check it matches the tag)
+        id: version
+        shell: bash
+        run: |
+          crate="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$crate" ]; then
+            echo "::error::could not read the version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" = "nightly" ]; then
+            prerelease=true
+            title="Nightly $crate"
+          else
+            if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$crate" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate. Bump the version in Cargo.toml (and run cargo build to update Cargo.lock) before tagging."
+              exit 1
+            fi
+            case "$crate" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+            title="Claude Switch $crate"
+          fi
+          {
+            echo "version=$crate"
+            echo "prerelease=$prerelease"
+            echo "title=$title"
+          } >> "$GITHUB_OUTPUT"
+          echo "$title (prerelease: $prerelease)"
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      EXE: target/${{ matrix.target }}/release/cswitch.exe
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check the binary needs no Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents $env:EXE | Out-String
+          Write-Host $deps
+          if ($deps -match 'VCRUNTIME|MSVCP') { throw "cswitch.exe links the Visual C++ runtime dynamically" }
+
+      - name: Smoke test
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $env:CSWITCH_HOME = Join-Path $env:RUNNER_TEMP "cswitch-smoke"
+          & $env:EXE --version; if ($LASTEXITCODE) { exit 1 }
+          & $env:EXE status --json; if ($LASTEXITCODE) { exit 1 }
+          & $env:EXE completions powershell | Out-Null; if ($LASTEXITCODE) { exit 1 }
+
+      - name: Archive
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "stage"
+          New-Item -ItemType Directory -Force $stage, dist | Out-Null
+          Copy-Item $env:EXE, LICENSE, README.md $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\cswitch-${{ matrix.target }}.zip"
+
+      - name: Install Inno Setup ${{ env.INNO_VERSION }}
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP "innosetup.exe"
+          $tag = "is-" + $env:INNO_VERSION.Replace(".", "_")
+          Invoke-WebRequest "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION-x64.exe" -OutFile $setup
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash
+          if ($hash -ne $env:INNO_SHA256) { throw "Inno Setup download does not match the pinned SHA-256 (got $hash)" }
+          $dir = Join-Path $env:RUNNER_TEMP "inno"
+          # Portable, per-user: no admin rights, no uninstall entry.
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CURRENTUSER", "/PORTABLE=1", "/DIR=$dir" -Wait -PassThru
+          if ($p.ExitCode) { throw "Inno Setup install failed ($($p.ExitCode))" }
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          ISCC.exe /Q "/DAppVersion=$env:VERSION" "/DArch=${{ matrix.arch }}" "/DSourceExe=$((Resolve-Path $env:EXE).Path)" "/DOutputDir=$((Resolve-Path dist).Path)" packaging\windows\cswitch.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      - name: Test installer (install, run, uninstall)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist\*-windows-x64-setup.exe).FullName
+          $log = Join-Path $env:RUNNER_TEMP "setup.log"
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$log" -Wait -PassThru
+          if ($p.ExitCode) { Get-Content $log; throw "setup failed ($($p.ExitCode))" }
+
+          $bin = Join-Path $env:USERPROFILE ".cswitch\bin"
+          foreach ($file in "cswitch.exe", "cswitchw.exe") {
+            if (-not (Test-Path "$bin\$file")) { Get-Content $log; throw "$file was not installed" }
+          }
+          & "$bin\cswitch.exe" --version; if ($LASTEXITCODE) { exit 1 }
+          # For the log only: doctor exits 1 here because the runner has no Claude Code or profiles.
+          & "$bin\cswitch.exe" doctor; $global:LASTEXITCODE = 0
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if (-not ($userPath -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin })) { throw "$bin is not on the user PATH" }
+          $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Claude Switch\Claude Switch.lnk"
+          if (-not (Test-Path $menu)) {
+            # The installer runs `cswitch install` hidden; run it again so its warnings show here.
+            & "$bin\cswitch.exe" install --no-router
+            throw "Start-menu shortcut missing"
+          }
+
+          $app = Join-Path $env:LOCALAPPDATA "Programs\Claude Switch"
+          Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          # The uninstaller hands over to a copy of itself, and cswitch removes ~/.cswitch/bin a
+          # few seconds after it exits: wait for both.
+          $deadline = (Get-Date).AddSeconds(90)
+          while (((Test-Path "$app\cswitch.exe") -or (Test-Path "$bin\cswitch.exe")) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          if (Test-Path "$app\cswitch.exe") { throw "uninstaller left $app behind" }
+          if (Test-Path "$bin\cswitch.exe") { throw "uninstall left $bin behind" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($userPath -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin }) { throw "$bin is still on the user PATH" }
+          if (Test-Path $menu) { throw "Start-menu shortcut left behind" }
+          Write-Host "Install / uninstall round trip OK"
+
+      - name: Test install.ps1
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          ./install.ps1 -Path $env:EXE -NoSetup
+          $bin = Join-Path $env:USERPROFILE ".cswitch\bin"
+          & "$bin\cswitch.exe" --version; if ($LASTEXITCODE) { exit 1 }
+          & "$bin\cswitch.exe" uninstall --yes; if ($LASTEXITCODE) { exit 1 }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            goarch: amd64
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            goarch: arm64
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BIN: target/${{ matrix.target }}/release/cswitch
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Static musl binaries, linked with Rust's own rust-lld (see .cargo/config.toml).
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Registers QEMU with binfmt_misc, so arm64 binaries and containers run on this x86_64 runner.
+      - uses: docker/setup-qemu-action@v4
+        if: matrix.arch == 'aarch64'
+
+      - name: Smoke test and shell completions
+        run: |
+          file "$BIN"
+          file "$BIN" | grep -q "statically linked\|static-pie linked"
+          "$BIN" --version
+          CSWITCH_HOME="$RUNNER_TEMP/cswitch-smoke" "$BIN" status --json
+          mkdir -p "$RUNNER_TEMP/completions"
+          "$BIN" completions bash > "$RUNNER_TEMP/completions/cswitch.bash"
+          "$BIN" completions zsh > "$RUNNER_TEMP/completions/_cswitch"
+          "$BIN" completions fish > "$RUNNER_TEMP/completions/cswitch.fish"
+
+      - name: Archive
+        run: |
+          mkdir -p dist "$RUNNER_TEMP/stage"
+          cp "$BIN" LICENSE README.md "$RUNNER_TEMP/stage/"
+          tar -czf "dist/cswitch-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/stage" .
+
+      - name: Install nfpm ${{ env.NFPM_VERSION }}
+        run: |
+          archive="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/$archive"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/nfpm" nfpm
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+
+      - name: Build packages (.deb .rpm .apk .pkg.tar.zst)
+        env:
+          ARCH: ${{ matrix.goarch }}
+          BINARY: ${{ env.BIN }}
+          COMPLETIONS: ${{ runner.temp }}/completions
+        run: |
+          for packager in deb rpm apk archlinux; do
+            nfpm package --config packaging/linux/nfpm.yaml --packager "$packager" --target dist/
+          done
+          ls -l dist
+
+      - name: Test packages (install in each distribution)
+        run: |
+          set -eu
+          platform="linux/${{ matrix.goarch }}"
+          check() {
+            echo "::group::$1"
+            docker run --rm --platform "$platform" -v "$PWD/dist:/dist:ro" "$1" sh -euc "$2"
+            echo "::endgroup::"
+          }
+          verify='cswitch --version && test -x /usr/bin/cswitch && test -f /usr/share/bash-completion/completions/cswitch'
+          # Checks the file, not `command -v`: the shell remembers where it found cswitch.
+          check debian:stable-slim "apt-get update -qq && apt-get install -y -qq --no-install-recommends /dist/*_${{ matrix.goarch }}.deb >/dev/null && $verify && apt-get remove -y -qq claude-switch >/dev/null && test ! -e /usr/bin/cswitch"
+          check alpine:latest "apk add -q --allow-untrusted /dist/*_${{ matrix.arch }}.apk && $verify"
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            # Emulated dnf / pacman are slow, so these two run natively only.
+            check fedora:latest "dnf install -y -q --setopt=install_weak_deps=False /dist/*.x86_64.rpm && $verify"
+            check archlinux:latest "pacman -U --noconfirm /dist/*-x86_64.pkg.tar.zst >/dev/null && $verify"
+          fi
+
+      - name: Test install.sh
+        run: |
+          set -eu
+          CSWITCH_BIN="$BIN" CSWITCH_NO_SETUP=1 sh install.sh
+          "$HOME/.cswitch/bin/cswitch" --version
+          grep -q ">>> claude-switch >>>" "$HOME/.bashrc"
+          "$HOME/.cswitch/bin/cswitch" uninstall --yes
+          test ! -e "$HOME/.cswitch/bin"
+          ! grep -q ">>> claude-switch >>>" "$HOME/.bashrc"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: version
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            min_os: "11.0"
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            min_os: "10.13"
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BIN: target/${{ matrix.target }}/release/cswitch
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.min_os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Apple Silicon only runs signed code; an ad-hoc signature is enough for a downloaded CLI.
+      - name: Sign (ad hoc)
+        run: |
+          codesign --force --sign - "$BIN"
+          codesign --verify --verbose "$BIN"
+          lipo -archs "$BIN" | grep -qx "${{ matrix.arch }}"
+
+      - name: Smoke test and shell completions
+        run: |
+          # The runner is Apple Silicon: the x86_64 build runs only if Rosetta is present.
+          if [ "${{ matrix.arch }}" = "arm64" ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
+            run="$BIN"
+          else
+            echo "::notice::Rosetta is not available, generating completions with a native build"
+            cargo build --release --locked
+            run=target/release/cswitch
+          fi
+          "$run" --version
+          CSWITCH_HOME="$RUNNER_TEMP/cswitch-smoke" "$run" status --json
+          mkdir -p "$RUNNER_TEMP/completions"
+          "$run" completions bash > "$RUNNER_TEMP/completions/cswitch.bash"
+          "$run" completions zsh > "$RUNNER_TEMP/completions/_cswitch"
+          "$run" completions fish > "$RUNNER_TEMP/completions/cswitch.fish"
+
+      - name: Archive
+        run: |
+          mkdir -p dist "$RUNNER_TEMP/stage"
+          cp "$BIN" LICENSE README.md "$RUNNER_TEMP/stage/"
+          tar -czf "dist/cswitch-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/stage" .
+
+      - name: Build installer (.pkg)
+        run: sh packaging/macos/build-pkg.sh "$BIN" "$VERSION" "${{ matrix.arch }}" "$RUNNER_TEMP/completions" dist
+
+      - name: Test installer (install, run, uninstall)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          sudo installer -pkg dist/claude-switch-*-macos-arm64.pkg -target /
+          test "$(readlink /usr/local/bin/cswitch)" = /usr/local/claude-switch/bin/cswitch
+          /usr/local/bin/cswitch --version
+          test -L /usr/local/share/zsh/site-functions/_cswitch
+          pkgutil --pkg-info io.github.samrand96.claude-switch
+          sudo /usr/local/claude-switch/uninstall.sh
+          test ! -e /usr/local/bin/cswitch
+          test ! -e /usr/local/claude-switch
+          ! pkgutil --pkg-info io.github.samrand96.claude-switch
+
+      - name: Test install.sh
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eu
+          CSWITCH_BIN="$BIN" CSWITCH_NO_SETUP=1 sh install.sh
+          "$HOME/.cswitch/bin/cswitch" --version
+          "$HOME/.cswitch/bin/cswitch" uninstall --yes
+          test ! -e "$HOME/.cswitch/bin"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [version, windows, linux, macos]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          v="$VERSION"
+          d="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          : > "$RUNNER_TEMP/notes.md"
+          if [ "$GITHUB_REF_NAME" = "nightly" ]; then
+            printf '> Nightly build of %s, not a stable release.\n\n' "$GITHUB_SHA" >> "$RUNNER_TEMP/notes.md"
+          fi
+          cat >> "$RUNNER_TEMP/notes.md" <<EOF
+          ## Download
+
+          | System | Installer | Portable |
+          | --- | --- | --- |
+          | Windows 10/11 (x64) | [claude-switch-$v-windows-x64-setup.exe]($d/claude-switch-$v-windows-x64-setup.exe) | [zip]($d/cswitch-x86_64-pc-windows-msvc.zip) |
+          | Windows 11 on ARM | [claude-switch-$v-windows-arm64-setup.exe]($d/claude-switch-$v-windows-arm64-setup.exe) | [zip]($d/cswitch-aarch64-pc-windows-msvc.zip) |
+          | macOS, Apple Silicon | [claude-switch-$v-macos-arm64.pkg]($d/claude-switch-$v-macos-arm64.pkg) | [tar.gz]($d/cswitch-aarch64-apple-darwin.tar.gz) |
+          | macOS, Intel | [claude-switch-$v-macos-x86_64.pkg]($d/claude-switch-$v-macos-x86_64.pkg) | [tar.gz]($d/cswitch-x86_64-apple-darwin.tar.gz) |
+          | Linux x86_64 | \`.deb\` · \`.rpm\` · \`.apk\` · \`.pkg.tar.zst\` below | [tar.gz]($d/cswitch-x86_64-unknown-linux-musl.tar.gz) |
+          | Linux arm64 | \`.deb\` · \`.rpm\` · \`.apk\` · \`.pkg.tar.zst\` below | [tar.gz]($d/cswitch-aarch64-unknown-linux-musl.tar.gz) |
+
+          After installing, run \`cswitch\` — the setup wizard takes it from there.
+          Linux packages: \`sudo apt install ./claude-switch_*.deb\`, \`sudo dnf install ./claude-switch-*.rpm\`,
+          \`sudo apk add --allow-untrusted ./claude-switch_*.apk\`, \`sudo pacman -U ./claude-switch-*.pkg.tar.zst\`.
+          Checksums: \`SHA256SUMS.txt\`.
+          EOF
+
+      - name: Remove the previous nightly
+        if: github.ref_name == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Keeps the tag; drops the old release so files from an older version don't linger.
+          if gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes
+          fi
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ needs.version.outputs.title }}
+          files: dist/*
+          body_path: ${{ runner.temp }}/notes.md
+          generate_release_notes: true
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true

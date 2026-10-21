@@ -1,0 +1,4 @@
+# Shell scripts run on macOS / Linux: a CRLF checkout on Windows must not break them.
+*.sh text eol=lf
+packaging/macos/postinstall text eol=lf
+packaging/linux/*.yaml text eol=lf
